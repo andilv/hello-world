@@ -1,0 +1,38 @@
+name: Publish to NPM
+
+on:
+  release:
+    types: [created] # Triggers when a new GitHub Release is created
+
+jobs:
+  publish-npm:
+    name: Publish package to NPM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Needed to checkout the repository
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4 # Or a newer version
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4 # Or a newer version
+        with:
+          node-version: '22' # Or your preferred LTS Node.js version
+          registry-url: 'https://registry.npmjs.org/' # Sets up .npmrc for publishing
+
+      - name: Install dependencies
+        run: npm ci # 'ci' is generally preferred over 'install' in CI environments
+
+      # Optional: Add a build step here if your library needs transpilation (e.g., TypeScript, Babel)
+      # - name: Build project
+      #   run: npm run build
+
+      # Optional: Add a test step here
+      # - name: Run tests
+      #   run: npm test
+
+      - name: Publish to NPM
+        run: npm publish --access public # '--access public' is needed for scoped public packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
