@@ -1,6 +1,6 @@
 {
   "name": "@andilv/hello-world",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "A simple Hello World library for demonstration.",
   "main": "index.js",
   "scripts": {
