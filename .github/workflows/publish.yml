@@ -24,9 +24,9 @@ jobs:
       - name: Install dependencies
         run: npm ci # 'ci' is generally preferred over 'install' in CI environments
 
-      # Optional: Add a build step here if your library needs transpilation (e.g., TypeScript, Babel)
-      # - name: Build project
-      #   run: npm run build
+      # Build step for TypeScript transpilation
+      - name: Build project
+        run: npm run build
 
       # Optional: Add a test step here
       # - name: Run tests

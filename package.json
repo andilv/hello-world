@@ -2,9 +2,11 @@
   "name": "@andilv/hello-world",
   "version": "0.0.1",
   "description": "A simple Hello World library for demonstration.",
-  "main": "index.js",
+  "main": "dist/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
   },
   "repository": {
     "type": "git",
@@ -23,8 +25,12 @@
   },
   "homepage": "https://github.com/andilv/hello-world#readme",
   "files": [
-    "index.js",
+    "dist/index.js",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "typescript": "^5.8.3"
+  }
 }
