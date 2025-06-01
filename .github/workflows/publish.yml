@@ -5,7 +5,31 @@ on:
     types: [created] # Triggers when a new GitHub Release is created
 
 jobs:
+  wait-for-tests:
+    name: Wait for tests to complete
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check test workflow status
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const conclusion = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'test.yml',
+              branch: 'main', // Assuming tests run on the main branch
+              event: 'push', // Assuming tests run on push to main
+              status: 'success',
+            });
+            if (conclusion.data.workflow_runs.length === 0) {
+              core.setFailed('No successful test runs found on main branch.');
+            }
+
   publish-npm:
+    needs: wait-for-tests
     name: Publish package to NPM
     runs-on: ubuntu-latest
     permissions:
