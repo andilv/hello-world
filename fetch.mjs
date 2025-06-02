@@ -1,4 +1,4 @@
-import { relayInit } from 'nostr-tools';
+import { SimplePool, useWebSocketImplementation } from 'nostr-tools/pool';
 import WebSocket from 'ws'; // Ensure ws is installed, nostr-tools might use it
 import fs from 'fs/promises';
 import path from 'path';
@@ -7,23 +7,20 @@ import { SPAM_EVENTS_FILE, spamConstants, analyzeEventForSpam } from './lib/spam
 const RELAY_URL = 'wss://relay.damus.io';
 const RAW_EVENTS_FILE = 'raw.jsonl'; // Keep this here or in a general constants file
 
-// connectToRelay function (remains the same)
+// Initialize WebSocket support for Node.js
+useWebSocketImplementation(WebSocket);
+
+// connectToRelay function (modified to use SimplePool)
 async function connectToRelay(url) {
-  const relay = relayInit(url);
-  relay.on('connect', () => console.log(`Connected to ${relay.url}`));
-  relay.on('error', (err) => console.error(`Failed to connect to ${relay.url}:`, err));
-  relay.on('disconnect', () => console.log(`Disconnected from ${relay.url}`));
-  try {
-    await relay.connect();
-  } catch (error) {
-    console.error(`Connection error with ${url}:`, error);
-    return null;
-  }
-  return relay;
+  // SimplePool doesn't require an explicit connect call for individual relays.
+  // It manages connections internally when you subscribe or query.
+  // We return a new pool instance. The URL is used when subscribing/querying.
+  console.log(`Relay URL for operations: ${url}`);
+  return new SimplePool();
 }
 
-// fetchPaginatedEvents function (remains the same)
-async function fetchPaginatedEvents(relay) {
+// fetchPaginatedEvents function (modified for SimplePool)
+async function fetchPaginatedEvents(pool, relayUrl) {
   const uniqueEvents = new Map();
   let currentUntil = Math.floor(Date.now() / 1000);
   const initialSince = currentUntil - 3600; // 1 hour ago
@@ -39,46 +36,60 @@ async function fetchPaginatedEvents(relay) {
 
   while (true) {
     const filter = { kinds: [1], limit: 100, until: currentUntil, since: initialSince };
-    console.log(`Subscribing with filter:`, filter);
-    const eventsInBatch = [];
-    let sub = relay.sub([filter]);
+    console.log(`Fetching events with filter:`, filter);
+    let eventsInBatch = []; // Ensure eventsInBatch is fresh for each iteration
+    let subCloser = null;
 
     await new Promise((resolve, reject) => {
-      sub.on('event', async (event) => {
+      const eoseTimeout = setTimeout(() => {
+        console.warn(`Timeout waiting for EOSE for filter:`, filter);
+        if (subCloser) {
+          subCloser.close(); // Close the subscription
+        }
+        resolve(); // Resolve to allow the loop to potentially break or continue
+      }, 30000); // 30 seconds timeout
+
+      const oneventCallback = (event) => {
         if (!uniqueEvents.has(event.id)) {
           uniqueEvents.set(event.id, event);
           eventsInBatch.push(event);
           totalFetched++;
-          console.log(JSON.stringify(event));
           try {
             const eventString = JSON.stringify(event);
-            await fs.appendFile(RAW_EVENTS_FILE, eventString + '\n');
+            fs.appendFile(RAW_EVENTS_FILE, eventString + '\n').catch(err => {
+              console.error(`Error appending event ${event.id} to ${RAW_EVENTS_FILE}:`, err);
+            });
           } catch (err) {
-            console.error(`Error appending event ${event.id} to ${RAW_EVENTS_FILE}:`, err);
+            console.error(`Immediate error appending event ${event.id} to ${RAW_EVENTS_FILE}:`, err);
           }
-        }
-      });
-      sub.on('eose', () => {
+        } // Closes the if block
+      }; // Closes the oneventCallback function assignment
+
+      const oneoseCallback = () => {
+        clearTimeout(eoseTimeout);
         console.log(`EOSE received for until=${currentUntil}. Batch size: ${eventsInBatch.length}, Total unique: ${totalFetched}`);
-        sub.unsub();
         resolve();
-      });
-      sub.on('error', (err) => {
-        console.error('Subscription error:', err);
-        sub.unsub();
-        reject(err);
-      });
-      const subTimeout = setTimeout(() => {
-        console.warn(`Subscription timeout for filter:`, filter);
-        sub.unsub();
+      };
+
+      const oncloseCallback = (reason) => {
+        clearTimeout(eoseTimeout);
+        console.log(`Subscription closed for filter:`, filter, `Reason: ${reason}`);
         resolve();
-      }, 30000);
-      sub.on('eose', () => clearTimeout(subTimeout));
-      sub.on('error', () => clearTimeout(subTimeout));
+      };
+
+      subCloser = pool.subscribe(
+        [relayUrl],
+        filter, // Pass the filter object directly
+        {
+          onevent: oneventCallback,
+          oneose: oneoseCallback,
+          onclose: oncloseCallback
+        }
+      );
     });
 
     if (eventsInBatch.length === 0) {
-      console.log('No new events received in this batch. Stopping pagination.');
+      console.log('No new unique events received in this batch. Stopping pagination.');
       break;
     }
     eventsInBatch.sort((a, b) => b.created_at - a.created_at);
@@ -102,16 +113,14 @@ async function fetchPaginatedEvents(relay) {
 // detectSpam function (remains largely the same)
 async function detectSpam() {
   console.log(`Starting spam detection from ${RAW_EVENTS_FILE} using modular functions.`);
-  const identifiedSpamEvents = new Map(); // To count unique spam events identified
+  const identifiedSpamEvents = new Map();
 
   try {
-    // Check if RAW_EVENTS_FILE exists and has content.
-    // This check is also present in IIFE, but good to have robustness here too.
     try {
       await fs.access(RAW_EVENTS_FILE);
     } catch (e) {
       console.log(`${RAW_EVENTS_FILE} not found by detectSpam. Skipping.`);
-      await fs.writeFile(SPAM_EVENTS_FILE, ''); // Ensure spam file is empty
+      await fs.writeFile(SPAM_EVENTS_FILE, '');
       console.log(`Initialized ${SPAM_EVENTS_FILE} as empty.`);
       return [];
     }
@@ -121,32 +130,25 @@ async function detectSpam() {
 
     if (lines.length === 0) {
         console.log(`${RAW_EVENTS_FILE} is empty. Skipping spam detection.`);
-        await fs.writeFile(SPAM_EVENTS_FILE, ''); // Ensure spam file is empty
+        await fs.writeFile(SPAM_EVENTS_FILE, '');
         console.log(`Initialized ${SPAM_EVENTS_FILE} as empty.`);
         return [];
     }
 
-    // Initialize spam.jsonl (clear it before appending)
     await fs.writeFile(SPAM_EVENTS_FILE, '');
     console.log(`Initialized ${SPAM_EVENTS_FILE}`);
 
-    const pubkeyActivity = {}; // Store history: { pubkey: [{content, created_at, id}, ...] }
+    const pubkeyActivity = {};
 
     for (const line of lines) {
       const event = JSON.parse(line);
-
-      // Ensure pubkey entry exists in activity log
       if (!pubkeyActivity[event.pubkey]) {
         pubkeyActivity[event.pubkey] = [];
       }
-      // userEventHistory is the history *before* this current event
       const userEventHistory = pubkeyActivity[event.pubkey];
-
-      // Analyze the event using the history *before* this event
       const reasons = analyzeEventForSpam(event, userEventHistory, spamConstants);
 
       if (reasons.length > 0) {
-        // Check if this specific event ID has already been marked as spam (e.g. if raw.jsonl had duplicates)
         if (!identifiedSpamEvents.has(event.id)) {
           event.spamReasons = reasons;
           identifiedSpamEvents.set(event.id, event);
@@ -157,29 +159,22 @@ async function detectSpam() {
           }
         }
       }
-
-      // Add current event's details to its pubkey's history for analysis of subsequent events
       userEventHistory.push({
         id: event.id,
         content: event.content,
         created_at: event.created_at
       });
-      // Optional: To keep pubkeyActivity from growing indefinitely with very old events not relevant
-      // to time-windowed checks, a pruning mechanism could be added here.
-      // For example, userEventHistory.sort((a,b) => a.created_at - b.created_at);
-      // then, find index of first event within max_time_window_needed and slice.
     }
     console.log(`Spam detection complete. Found ${identifiedSpamEvents.size} potential spam events.`);
     return Array.from(identifiedSpamEvents.values());
 
   } catch (error) {
     console.error('Error during spam detection:', error);
-    // Ensure SPAM_EVENTS_FILE is empty in case of error partway through processing
     try {
         await fs.writeFile(SPAM_EVENTS_FILE, '');
         console.log(`Cleared ${SPAM_EVENTS_FILE} due to error during detection.`);
     } catch (e) { /* ignore cleanup error */ }
-    return []; // Return empty array on error
+    return [];
   }
 }
 
@@ -213,7 +208,6 @@ async function reportSpamExamples(limit = 10) {
       if (event.spamReasons && event.spamReasons.length > 0) {
         event.spamReasons.forEach(reason => console.log(`    - ${reason}`));
       } else {
-        // This case should ideally not be hit if spamReason is always populated by detectSpam
         console.log(`    - No specific reasons recorded.`);
       }
       reportedCount++;
@@ -226,7 +220,6 @@ async function reportSpamExamples(limit = 10) {
         console.log(`\nDisplayed all ${reportedCount} spam events found in ${SPAM_EVENTS_FILE}.`)
     }
 
-
   } catch (error) {
     if (error.code === 'ENOENT') {
         console.log(`${SPAM_EVENTS_FILE} not found. Run spam detection first.`);
@@ -237,34 +230,27 @@ async function reportSpamExamples(limit = 10) {
 }
 
 (async () => {
-  console.log('Attempting to connect to relay...');
-  const relay = await connectToRelay(RELAY_URL);
-  // let allFetchedEvents = []; // This variable is not directly used to gate spam detection anymore
+  console.log('Attempting to connect to relay using SimplePool...');
+  const pool = await connectToRelay(RELAY_URL);
 
-  if (relay) {
+  if (pool) {
     try {
-      console.log('Relay object obtained. Starting paginated event fetching...');
-      /*allFetchedEvents = */ await fetchPaginatedEvents(relay); // Result not strictly needed here
-      // console.log(`Successfully fetched ${allFetchedEvents.length} unique events to ${RAW_EVENTS_FILE}.`);
+      console.log('SimplePool instance obtained. Starting paginated event fetching...');
+      await fetchPaginatedEvents(pool, RELAY_URL);
     } catch (error) {
       console.error('An error occurred during event fetching:', error);
     } finally {
-      if (relay && (relay.status === WebSocket.OPEN || relay.status === WebSocket.CONNECTING)) {
-        console.log('Closing relay connection.');
-        await relay.close();
-      } else if (relay) {
-        console.log(`Relay status: ${relay.status}. Not attempting to close.`);
-      }
+      console.log('Closing connections in SimplePool.');
+      pool.close([RELAY_URL]);
     }
   } else {
-    console.log('Could not establish relay connection.');
+    console.log('Could not initialize SimplePool.');
   }
 
-  // Determine if raw events were fetched by checking RAW_EVENTS_FILE
   let rawEventsExist = false;
   try {
     const stats = await fs.stat(RAW_EVENTS_FILE);
-    if (stats.size > 0) { // Check if file has content
+    if (stats.size > 0) {
         rawEventsExist = true;
     } else {
         console.log(`${RAW_EVENTS_FILE} is empty. Skipping spam detection and reporting.`);
@@ -281,7 +267,6 @@ async function reportSpamExamples(limit = 10) {
     await detectSpam();
     await reportSpamExamples(10);
   } else {
-    // Ensure spam.jsonl is empty if no raw events processed
     try {
         await fs.writeFile(SPAM_EVENTS_FILE, '');
         console.log(`Initialized empty ${SPAM_EVENTS_FILE} as no raw events were processed.`);
